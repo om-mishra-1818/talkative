@@ -169,6 +169,10 @@ class SupabaseRealtimeService {
     // so without a limit a long chat re-downloads its entire history on every
     // new message. Older messages already live in local Isar, so we only need
     // the live tail here.
+    // Guarantee initial messages are loaded via HTTP in case the stream doesn't emit them
+    // or Realtime is not fully enabled on the table.
+    fetchOlderMessages(chatId);
+
     _messagesSubscription = _client
         .from('messages')
         .stream(primaryKey: ['id'])
@@ -249,21 +253,21 @@ class SupabaseRealtimeService {
     String otherUserId,
     MessageEntity message,
   ) async {
-    // Broadcast to the other user's global channel. The channel must be torn
-    // down after sending — otherwise every edit/delete registers a new channel
-    // (and socket binding) in the client that is never released, leaking them
-    // for the whole session.
     final channel = _client.channel('global_$otherUserId');
-    try {
-      await channel.sendBroadcastMessage(
-        event: 'new_message',
-        payload: message.toJson(),
-      );
-    } catch (e) {
-      debugPrint('Broadcast failed: $e');
-    } finally {
-      await _client.removeChannel(channel);
-    }
+    channel.subscribe((status, [error]) async {
+      if (status == RealtimeSubscribeStatus.subscribed) {
+        try {
+          await channel.sendBroadcastMessage(
+            event: 'new_message',
+            payload: message.toJson(),
+          );
+        } catch (e) {
+          debugPrint('Broadcast failed: $e');
+        } finally {
+          await _client.removeChannel(channel);
+        }
+      }
+    });
   }
 
   Future<void> sendTypingEvent(String chatId, String myUserId, bool isTyping) async {

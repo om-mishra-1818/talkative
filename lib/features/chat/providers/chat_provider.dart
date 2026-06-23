@@ -324,6 +324,8 @@ class ChatProvider with ChangeNotifier {
     final chatId = _activeChat!.id;
     if (chatId.isEmpty) return;
 
+    final otherUserId = _activeChat!.otherUserId;
+
     // Soft-Blocking System
     final isBlocked = _activeChat!.isBlocked ?? false;
 
@@ -354,9 +356,16 @@ class ChatProvider with ChangeNotifier {
     // remains visible on screen rather than being cleared.
     final bool didSync = await locator<SupabaseRealtimeService>()
         .sendMessageToSupabase(message);
-    if (didSync && !message.isSynced) {
+    if (didSync) {
       message.isSynced = true;
       await locator<LocalDb>().updateMessage(message);
+      // Broadcast to the receiver's global channel so they receive the message
+      // regardless of whether they have this chat open or Postgres realtime is
+      // configured on the messages table. Mirrors the path deleteMessage uses.
+      await locator<SupabaseRealtimeService>().broadcastMessage(
+        otherUserId,
+        message,
+      );
     }
 
     // Optional: Update Firestore chat metadata for unread counts
@@ -384,10 +393,12 @@ class ChatProvider with ChangeNotifier {
     // In a real app, you might send a specific "edit" event package.
     // For now, broadcasting the same message ID will overwrite it on the receiver's local DB
     // if we implement the receiver to use `put` with the same ID.
-    await locator<SupabaseRealtimeService>().broadcastMessage(
-      message.chatId,
-      message,
-    );
+    if (_activeChat != null) {
+      await locator<SupabaseRealtimeService>().broadcastMessage(
+        _activeChat!.otherUserId,
+        message,
+      );
+    }
   }
 
   void deleteMessage(MessageEntity message) async {
