@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:talkative/core/network/supabase_realtime_service.dart';
 import 'package:talkative/core/storage/local_db.dart';
 import 'package:talkative/features/chat/providers/user_profile_provider.dart';
@@ -8,21 +8,11 @@ import '../models/media_type.dart';
 import '../../../core/di/locator.dart';
 import '../domain/entities/message_entity.dart';
 import 'package:flutter/foundation.dart';
-
 import 'dart:async';
-import 'package:firebase_auth/firebase_auth.dart';
 
 class ChatProvider with ChangeNotifier {
-  FirebaseFirestore? get _firestore {
-    try {
-      return FirebaseFirestore.instance;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  final SupabaseRealtimeService _realtimeService =
-      locator<SupabaseRealtimeService>();
+  final SupabaseRealtimeService _realtimeService = locator<SupabaseRealtimeService>();
+  SupabaseClient get _supabase => locator<SupabaseRealtimeService>().client;
 
   List<ChatModel> _chats = [];
   ChatModel? _activeChat;
@@ -30,17 +20,15 @@ class ChatProvider with ChangeNotifier {
   List<ChatModel> _searchResults = [];
   String _chatFilter = 'All';
 
-  StreamSubscription? _chatsSubscription;
-  StreamSubscription? _authSubscription;
-
-  // Cache of fetched user profiles, keyed by userId. The chats snapshot fires
-  // on every lastMessage/unreadCount change, but user profiles rarely change —
-  // caching them turns a per-message N+1 fetch storm into a one-time load.
+  RealtimeChannel? _chatsSubscription;
+  StreamSubscription<AuthState>? _authSubscription;
+  
   final Map<String, Map<String, dynamic>> _userCache = {};
 
   ChatProvider() {
-    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
-      _chatsSubscription?.cancel();
+    _authSubscription = _supabase.auth.onAuthStateChange.listen((data) {
+      final Session? session = data.session;
+      _chatsSubscription?.unsubscribe();
       _chats = [];
       _activeChat = null;
       _searchResults = [];
@@ -50,11 +38,16 @@ class ChatProvider with ChangeNotifier {
       _realtimeService.leaveCurrentChat();
       notifyListeners();
 
-      if (user != null) {
-        _listenToChats(user.uid);
-        _realtimeService.initGlobalListener(user.uid);
+      if (session?.user != null) {
+        _initChats(session!.user!.id);
+        _realtimeService.initGlobalListener(session.user!.id);
       }
     });
+  }
+
+  static String directRoomId(String userA, String userB) {
+    final ids = [userA, userB]..sort();
+    return 'direct_${ids[0]}_${ids[1]}';
   }
 
   ValueNotifier<List<String>> get presentUsers => _realtimeService.presentUsers;
@@ -97,14 +90,12 @@ class ChatProvider with ChangeNotifier {
       result = result.where((c) => c.lastMessage.contains('http')).toList();
     }
 
-    // Filter out empty chats (where no messages have been sent) unless we are searching
     if (_searchQuery.isEmpty) {
       result = result
           .where((c) => c.lastMessage.isNotEmpty || c.time != null)
           .toList();
     }
 
-    // Sort by latest message time
     result.sort((a, b) {
       if (a.time == null && b.time == null) return 0;
       if (a.time == null) return 1;
@@ -119,104 +110,116 @@ class ChatProvider with ChangeNotifier {
   String get searchQuery => _searchQuery;
   ChatModel? get activeChat => _activeChat;
 
-  void _listenToChats(String currentUserId) {
-    if (_firestore == null) return;
+  Future<void> _fetchAndProcessChats(String currentUserId) async {
+    try {
+      final data = await _supabase
+          .from('chats')
+          .select()
+          .contains('users', [currentUserId]);
+          
+      final List<Map<String, dynamic>> docs = List<Map<String, dynamic>>.from(data);
 
-    _chatsSubscription = _firestore!
-        .collection('chats')
-        .where('users', arrayContains: currentUserId)
-        .snapshots()
-        .listen(
-          (snapshot) async {
-            // Step 1: resolve the "other user" for each chat and fetch only the
-            // profiles we don't already have cached — in parallel, not in a
-            // sequential await loop. Repeat snapshot fires (every message) now
-            // do zero network reads once profiles are warm.
-            final missingIds = <String>{};
-            for (var doc in snapshot.docs) {
-              final users = List<String>.from(doc.data()['users'] ?? []);
-              final otherUserId = users.firstWhere(
-                (id) => id != currentUserId,
-                orElse: () => currentUserId,
-              );
-              if (!_userCache.containsKey(otherUserId)) {
-                missingIds.add(otherUserId);
-              }
-            }
-
-            if (missingIds.isNotEmpty) {
-              try {
-                final fetched = await Future.wait(
-                  missingIds.map(
-                    (id) =>
-                        _firestore!.collection('users').doc(id).get(),
-                  ),
-                );
-                for (final userDoc in fetched) {
-                  if (userDoc.exists) {
-                    _userCache[userDoc.id] = userDoc.data()!;
-                  }
-                }
-              } catch (e) {
-                debugPrint('Error fetching user data for chats: $e');
-              }
-            }
-
-            // Step 2: build the chat list purely from the snapshot + cache.
-            final List<ChatModel> loadedChats = [];
-            for (var doc in snapshot.docs) {
-              final data = doc.data();
-              final users = List<String>.from(data['users'] ?? []);
-              final otherUserId = users.firstWhere(
-                (id) => id != currentUserId,
-                orElse: () => currentUserId,
-              );
-              final userData = _userCache[otherUserId];
-              if (userData == null) continue;
-
-              loadedChats.add(
-                ChatModel(
-                  id: doc.id,
-                  otherUserId: otherUserId,
-                  name: userData['username'] ?? 'Unknown',
-                  avatarUrl: userData['avatarUrl'] ?? '',
-                  isOnline: userData['isOnline'] ?? false,
-                  status:
-                      userData['status'] ??
-                      (userData['isOnline'] == true ? 'Available' : 'Offline'),
-                  phoneNumber: userData['phoneNumber'] ?? '',
-                  lastMessage: data['lastMessage'] ?? '',
-                  mediaType: MediaTypeExt.fromString(
-                    data['lastMessageType'] ?? 'text',
-                  ),
-                  time: (data['lastMessageTime'] as Timestamp?)?.toDate(),
-                  unreadCount: data['unreadCount_$currentUserId'] ?? 0,
-                  hasActiveCall: data['hasActiveCall'] ?? false,
-                ),
-              );
-            }
-            _chats = loadedChats;
-            notifyListeners();
-          },
-          onError: (error) {
-            debugPrint('Error listening to chats: $error');
-          },
+      final missingIds = <String>{};
+      for (var doc in docs) {
+        final users = List<String>.from(doc['users'] ?? []);
+        final otherUserId = users.firstWhere(
+          (id) => id != currentUserId,
+          orElse: () => currentUserId,
         );
+        if (!_userCache.containsKey(otherUserId)) {
+          missingIds.add(otherUserId);
+        }
+      }
+
+      if (missingIds.isNotEmpty) {
+        try {
+          final fetched = await _supabase
+              .from('users')
+              .select()
+              .inFilter('id', missingIds.toList());
+              
+          for (final userDoc in fetched) {
+            _userCache[userDoc['id']] = userDoc;
+          }
+        } catch (e) {
+          debugPrint('Error fetching user data for chats: $e');
+        }
+      }
+
+      final List<ChatModel> loadedChats = [];
+      for (var doc in docs) {
+        final users = List<String>.from(doc['users'] ?? []);
+        final otherUserId = users.firstWhere(
+          (id) => id != currentUserId,
+          orElse: () => currentUserId,
+        );
+        final userData = _userCache[otherUserId];
+        if (userData == null) continue;
+        
+        final unreadCountMap = doc['unread_count'] as Map<String, dynamic>? ?? {};
+        final unreadCount = unreadCountMap[currentUserId] ?? 0;
+
+        loadedChats.add(
+          ChatModel(
+            id: doc['id'],
+            otherUserId: otherUserId,
+            name: userData['username'] ?? 'Unknown',
+            avatarUrl: userData['avatarUrl'] ?? '',
+            isOnline: userData['isOnline'] ?? false,
+            status:
+                userData['status'] ??
+                (userData['isOnline'] == true ? 'Available' : 'Offline'),
+            phoneNumber: userData['phoneNumber'] ?? '',
+            lastMessage: doc['lastMessage'] ?? '',
+            mediaType: MediaTypeExt.fromString(
+              doc['lastMessageType'] ?? 'text',
+            ),
+            time: doc['lastMessageTime'] != null ? DateTime.parse(doc['lastMessageTime']).toLocal() : null,
+            unreadCount: unreadCount,
+            hasActiveCall: doc['hasActiveCall'] ?? false,
+          ),
+        );
+      }
+      _chats = loadedChats;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error fetching chats: $e');
+    }
   }
 
-  void setActiveChat(ChatModel chat) {
+  void _initChats(String currentUserId) {
+    _fetchAndProcessChats(currentUserId);
+
+    _chatsSubscription = _supabase
+        .channel('public:chats')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'chats',
+          callback: (payload) {
+            // Realtime doesn't easily filter by array contains, but RLS protects it.
+            // When we receive an event, we'll just re-fetch the chats.
+            _fetchAndProcessChats(currentUserId);
+          },
+        )
+        .subscribe();
+  }
+
+  void setActiveChat(ChatModel chat) async {
     _activeChat = chat;
     if (chat.id.isNotEmpty) {
-      final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+      final currentUserId = _supabase.auth.currentUser?.id;
       _realtimeService.subscribeToChat(chat.id, currentUserId ?? '');
 
-      // Clear unread count when opening the chat
-      if (_firestore != null && currentUserId != null) {
-        _firestore!
-            .collection('chats')
-            .doc(chat.id)
-            .update({'unreadCount_$currentUserId': 0})
-            .catchError((_) {});
+      if (currentUserId != null) {
+        try {
+          final data = await _supabase.from('chats').select('unread_count').eq('id', chat.id).single();
+          final unreadCountMap = Map<String, dynamic>.from(data['unread_count'] ?? {});
+          unreadCountMap[currentUserId] = 0;
+          await _supabase.from('chats').update({'unread_count': unreadCountMap}).eq('id', chat.id);
+        } catch (e) {
+          debugPrint('Error clearing unread count: $e');
+        }
       }
     }
     notifyListeners();
@@ -230,33 +233,35 @@ class ChatProvider with ChangeNotifier {
       return;
     }
 
-    final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+    final currentUserId = _supabase.auth.currentUser?.id;
 
-    if (_firestore == null) return;
-    final snapshot = await _firestore!.collection('users').get();
+    try {
+      final snapshot = await _supabase
+          .from('users')
+          .select()
+          .neq('id', currentUserId ?? '');
 
-    _searchResults = snapshot.docs
-        .where((doc) {
-          final data = doc.data();
-          final username = (data['username'] as String?)?.toLowerCase() ?? '';
-          final phone = (data['phoneNumber'] as String?)?.toLowerCase() ?? '';
-          return doc.id != currentUserId &&
-              (username.contains(query.toLowerCase()) ||
-                  phone.contains(query.toLowerCase()));
-        })
-        .map((doc) {
-          final data = doc.data();
-          return ChatModel(
-            id: '', // Not a chat yet
-            otherUserId: doc.id,
-            name: data['username'] ?? 'Unknown',
-            avatarUrl: data['avatarUrl'] ?? '',
-            isOnline: data['isOnline'] ?? false,
-            status: data['status'] ?? 'Offline',
-            phoneNumber: data['phoneNumber'] ?? '',
-          );
-        })
-        .toList();
+      _searchResults = snapshot
+          .where((doc) {
+            final username = (doc['username'] as String?)?.toLowerCase() ?? '';
+            final phone = (doc['phoneNumber'] as String?)?.toLowerCase() ?? '';
+            return username.contains(query.toLowerCase()) || phone.contains(query.toLowerCase());
+          })
+          .map((doc) {
+            return ChatModel(
+              id: '', // Not a chat yet
+              otherUserId: doc['id'],
+              name: doc['username'] ?? 'Unknown',
+              avatarUrl: doc['avatarUrl'] ?? '',
+              isOnline: doc['isOnline'] ?? false,
+              status: doc['status'] ?? 'Offline',
+              phoneNumber: doc['phoneNumber'] ?? '',
+            );
+          })
+          .toList();
+    } catch (e) {
+      debugPrint('Error searching users: $e');
+    }
 
     notifyListeners();
   }
@@ -264,9 +269,7 @@ class ChatProvider with ChangeNotifier {
   Timer? _searchDebounce;
 
   void setSearchQuery(String query) {
-    // Debounce: a full-collection user query per keystroke is what hammers the
-    // network while typing. Wait until the user pauses (350ms) before firing.
-    _searchQuery = query; // keep UI filter responsive immediately
+    _searchQuery = query;
     _searchDebounce?.cancel();
     if (query.isEmpty) {
       _searchResults = [];
@@ -280,8 +283,8 @@ class ChatProvider with ChangeNotifier {
   }
 
   Future<void> startChatWith(ChatModel user) async {
-    final currentUserId = FirebaseAuth.instance.currentUser?.uid;
-    if (currentUserId == null || _firestore == null) return;
+    final currentUserId = _supabase.auth.currentUser?.id;
+    if (currentUserId == null) return;
 
     final existingChatIndex = _chats.indexWhere(
       (c) => c.otherUserId == user.otherUserId,
@@ -289,22 +292,28 @@ class ChatProvider with ChangeNotifier {
     if (existingChatIndex != -1) {
       setActiveChat(_chats[existingChatIndex]);
     } else {
-      final chatDoc = await _firestore!.collection('chats').add({
-        'users': [currentUserId, user.otherUserId],
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-
-      final newChat = ChatModel(
-        id: chatDoc.id,
-        otherUserId: user.otherUserId,
-        name: user.name,
-        avatarUrl: user.avatarUrl,
-        isOnline: user.isOnline,
-        status: user.status,
-        phoneNumber: user.phoneNumber,
-      );
-      _chats.insert(0, newChat);
-      setActiveChat(newChat);
+      try {
+        final chatDocList = await _supabase.from('chats').insert({
+          'users': [currentUserId, user.otherUserId],
+        }).select();
+        
+        if (chatDocList.isNotEmpty) {
+          final chatDoc = chatDocList.first;
+          final newChat = ChatModel(
+            id: chatDoc['id'],
+            otherUserId: user.otherUserId,
+            name: user.name,
+            avatarUrl: user.avatarUrl,
+            isOnline: user.isOnline,
+            status: user.status,
+            phoneNumber: user.phoneNumber,
+          );
+          _chats.insert(0, newChat);
+          setActiveChat(newChat);
+        }
+      } catch (e) {
+        debugPrint('Error creating chat: $e');
+      }
     }
 
     _searchQuery = '';
@@ -318,7 +327,7 @@ class ChatProvider with ChangeNotifier {
     MediaType mediaType = MediaType.text,
   }) async {
     if (_activeChat == null || text.trim().isEmpty) return;
-    final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+    final currentUserId = _supabase.auth.currentUser?.id;
     if (currentUserId == null) return;
 
     final chatId = _activeChat!.id;
@@ -326,7 +335,6 @@ class ChatProvider with ChangeNotifier {
 
     final otherUserId = _activeChat!.otherUserId;
 
-    // Soft-Blocking System
     final isBlocked = _activeChat!.isBlocked ?? false;
 
     final message = MessageEntity()
@@ -337,48 +345,36 @@ class ChatProvider with ChangeNotifier {
       ..timestamp = DateTime.now()
       ..textVolume = volume
       ..mediaType = mediaType.name
-      // Optimistic: assume pending until the server confirms the insert.
       ..isSynced = false;
 
-    // STEP 1A/1B: Write to local Isar immediately. The Chat screen's
-    // StreamBuilder is bound to watchMessagesForChat(), so this single write
-    // makes the sender's bubble appear instantly — no network involved.
     await locator<LocalDb>().saveMessage(message);
 
-    if (isBlocked) {
-      // System intercepts and freezes the payload. The message stays trapped
-      // locally as pending (isSynced == false) and is never broadcast.
-      return;
-    }
+    if (isBlocked) return;
 
-    // STEP 1C: Fire the payload at Supabase in the background. On success we
-    // flip the local row to synced; on failure it stays pending/failed and
-    // remains visible on screen rather than being cleared.
     final bool didSync = await locator<SupabaseRealtimeService>()
         .sendMessageToSupabase(message);
     if (didSync) {
       message.isSynced = true;
       await locator<LocalDb>().updateMessage(message);
-      // Broadcast to the receiver's global channel so they receive the message
-      // regardless of whether they have this chat open or Postgres realtime is
-      // configured on the messages table. Mirrors the path deleteMessage uses.
       await locator<SupabaseRealtimeService>().broadcastMessage(
         otherUserId,
         message,
       );
     }
 
-    // Optional: Update Firestore chat metadata for unread counts
-    if (_firestore != null) {
-      final chatRef = _firestore!.collection('chats').doc(chatId);
-      chatRef
-          .update({
-            'lastMessage': text,
-            'lastMessageTime': FieldValue.serverTimestamp(),
-            'lastMessageType': mediaType.name,
-            'unreadCount_${_activeChat!.otherUserId}': FieldValue.increment(1),
-          })
-          .catchError((_) {});
+    try {
+      final chatData = await _supabase.from('chats').select('unread_count').eq('id', chatId).single();
+      final unreadCountMap = Map<String, dynamic>.from(chatData['unread_count'] ?? {});
+      unreadCountMap[otherUserId] = (unreadCountMap[otherUserId] as int? ?? 0) + 1;
+      
+      await _supabase.from('chats').update({
+        'lastMessage': text,
+        'lastMessageTime': DateTime.now().toUtc().toIso8601String(),
+        'lastMessageType': mediaType.name,
+        'unread_count': unreadCountMap,
+      }).eq('id', chatId);
+    } catch (e) {
+      debugPrint('Error updating chat metadata: $e');
     }
   }
 
@@ -386,13 +382,8 @@ class ChatProvider with ChangeNotifier {
     message.text = newText;
     message.isEdited = true;
 
-    // Update locally
     await locator<LocalDb>().updateMessage(message);
 
-    // Broadcast update
-    // In a real app, you might send a specific "edit" event package.
-    // For now, broadcasting the same message ID will overwrite it on the receiver's local DB
-    // if we implement the receiver to use `put` with the same ID.
     if (_activeChat != null) {
       await locator<SupabaseRealtimeService>().broadcastMessage(
         _activeChat!.otherUserId,
@@ -402,51 +393,45 @@ class ChatProvider with ChangeNotifier {
   }
 
   void deleteMessage(MessageEntity message) async {
-    // Delete locally
     await locator<LocalDb>().deleteMessage(message.messageId);
 
-    // Broadcast deletion (Using text = '[DELETED]')
     message.text = '[DELETED]';
     await locator<SupabaseRealtimeService>().broadcastMessage(
       _activeChat!.otherUserId,
       message,
     );
 
-    if (_firestore != null) {
-      final lastMsg = await locator<LocalDb>().getLastMessageForChat(
-        message.chatId,
-      );
-      final chatRef = _firestore!.collection('chats').doc(message.chatId);
+    try {
+      final lastMsg = await locator<LocalDb>().getLastMessageForChat(message.chatId);
 
       if (lastMsg != null) {
-        chatRef
-            .update({
-              'lastMessage': lastMsg.text,
-              'lastMessageType': lastMsg.mediaType,
-            })
-            .catchError((_) {});
+        await _supabase.from('chats').update({
+          'lastMessage': lastMsg.text,
+          'lastMessageType': lastMsg.mediaType,
+        }).eq('id', message.chatId);
       } else {
-        chatRef
-            .update({'lastMessage': '', 'lastMessageType': 'text'})
-            .catchError((_) {});
+        await _supabase.from('chats').update({
+          'lastMessage': '',
+          'lastMessageType': 'text',
+        }).eq('id', message.chatId);
       }
-    }
+    } catch (e) {}
   }
 
   Future<void> toggleBlockStatus() async {
-    if (_activeChat == null || _firestore == null) return;
+    if (_activeChat == null) return;
 
     final currentStatus = _activeChat!.isBlocked ?? false;
     final newStatus = !currentStatus;
 
-    // Update locally / active chat
     _activeChat = _activeChat!.copyWith(isBlocked: newStatus);
     notifyListeners();
 
-    // Update in Firestore globally
-    await _firestore!.collection('chats').doc(_activeChat!.id).update({
-      'is_blocked': newStatus,
-    });
+    try {
+      await _supabase.from('chats').update({
+        'is_blocked': newStatus,
+      }).eq('id', _activeChat!.id);
+    } catch (e) {}
   }
 
   Future<void> markMessagesAsRead(List<MessageEntity> unreadMessages) async {
@@ -459,11 +444,9 @@ class ChatProvider with ChangeNotifier {
     await locator<SupabaseRealtimeService>().markMessagesAsReadInSupabase(ids);
   }
 
-  // --- Older-history pagination (lazy, scroll-up triggered) ---
   bool _isLoadingHistory = false;
   bool get isLoadingHistory => _isLoadingHistory;
 
-  // Chats whose history has been fully backfilled — stop requesting more.
   final Set<String> _historyExhausted = {};
 
   bool get isActiveHistoryExhausted {
@@ -471,17 +454,11 @@ class ChatProvider with ChangeNotifier {
     return id != null && _historyExhausted.contains(id);
   }
 
-  /// Pulls one page of older messages for the active chat from Supabase into
-  /// local Isar. Safe to call repeatedly: it no-ops while a load is in flight
-  /// or once a chat's history is exhausted, so the UI can call it freely on
-  /// scroll without flooding the network.
   Future<void> loadOlderMessages() async {
     final chat = _activeChat;
     if (chat == null || chat.id.isEmpty) return;
     if (_isLoadingHistory || _historyExhausted.contains(chat.id)) return;
 
-    // Anchor on the oldest message we already have. If we have none yet, the
-    // live stream is still populating — let it, rather than double-fetching.
     final oldest = await locator<LocalDb>().getOldestMessageForChat(chat.id);
     if (oldest == null) return;
 
@@ -503,19 +480,17 @@ class ChatProvider with ChangeNotifier {
     if (_activeChat == null || _activeChat!.id.isEmpty) {
       return Stream.value([]);
     }
-    // Zero-cost local database stream
     return locator<LocalDb>().watchMessagesForChat(_activeChat!.id);
   }
 
   void sendTypingEvent(bool isTyping) {
     if (_activeChat == null) return;
     
-    // Check if my own typing indicator setting is ON
     final profileProvider = locator<UserProfileProvider>();
     final isTypingAllowed = profileProvider.profile?.typingIndicators ?? true;
     if (!isTypingAllowed) return;
 
-    final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+    final currentUserId = _supabase.auth.currentUser?.id;
     if (currentUserId == null) return;
     
     locator<SupabaseRealtimeService>().sendTypingEvent(_activeChat!.id, currentUserId, isTyping);
@@ -534,23 +509,21 @@ class ChatProvider with ChangeNotifier {
   }
 
   void answerCall(ChatModel chat) async {
-    if (_firestore == null) return;
-    await _firestore!.collection('chats').doc(chat.id).update({
-      'hasActiveCall': false,
-    });
+    try {
+      await _supabase.from('chats').update({'hasActiveCall': false}).eq('id', chat.id);
+    } catch (e) {}
   }
 
   void declineCall(ChatModel chat) async {
-    if (_firestore == null) return;
-    await _firestore!.collection('chats').doc(chat.id).update({
-      'hasActiveCall': false,
-    });
+    try {
+      await _supabase.from('chats').update({'hasActiveCall': false}).eq('id', chat.id);
+    } catch (e) {}
   }
 
   @override
   void dispose() {
     _authSubscription?.cancel();
-    _chatsSubscription?.cancel();
+    _chatsSubscription?.unsubscribe();
     _searchDebounce?.cancel();
     super.dispose();
   }

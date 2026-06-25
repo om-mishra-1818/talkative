@@ -1,8 +1,7 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:provider/provider.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import '../providers/chat_provider.dart';
 import '../models/chat_model.dart';
 import '../../../core/widgets/custom_avatar.dart';
@@ -19,6 +18,7 @@ class ContactsScreen extends StatefulWidget {
 class _ContactsScreenState extends State<ContactsScreen> {
   String _searchQuery = '';
   final TextEditingController _searchController = TextEditingController();
+  final SupabaseClient _supabase = Supabase.instance.client;
 
   @override
   void dispose() {
@@ -28,7 +28,7 @@ class _ContactsScreenState extends State<ContactsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+    final currentUserId = _supabase.auth.currentUser?.id;
 
     return Column(
       children: [
@@ -69,15 +69,12 @@ class _ContactsScreenState extends State<ContactsScreen> {
               ? const Center(
                   child: Text('Search for a username to start chatting.'),
                 )
-              : StreamBuilder<QuerySnapshot>(
-                  stream: FirebaseFirestore.instance
-                      .collection('users')
-                      .where('username', isGreaterThanOrEqualTo: _searchQuery)
-                      .where(
-                        'username',
-                        isLessThanOrEqualTo: '$_searchQuery\uf8ff',
-                      )
-                      .snapshots(),
+              : FutureBuilder<List<Map<String, dynamic>>>(
+                  future: _supabase
+                      .from('users')
+                      .select()
+                      .ilike('username', '%$_searchQuery%')
+                      .neq('id', currentUserId ?? ''),
                   builder: (context, snapshot) {
                     if (snapshot.connectionState == ConnectionState.waiting) {
                       return const Center(child: CircularProgressIndicator());
@@ -85,22 +82,16 @@ class _ContactsScreenState extends State<ContactsScreen> {
                     if (snapshot.hasError) {
                       return Center(
                         child: Text(
-                          'Error loading contacts. Please check Firebase rules.\n${snapshot.error}',
+                          'Error loading contacts.\n${snapshot.error}',
                           textAlign: TextAlign.center,
                         ),
                       );
                     }
-                    if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                    if (!snapshot.hasData || snapshot.data!.isEmpty) {
                       return const Center(child: Text('No users found.'));
                     }
 
-                    final users = snapshot.data!.docs
-                        .where((doc) => doc.id != currentUserId)
-                        .toList();
-
-                    if (users.isEmpty) {
-                      return const Center(child: Text('No users found.'));
-                    }
+                    final users = snapshot.data!;
 
                     return ListView.builder(
                       padding: const EdgeInsets.only(
@@ -110,9 +101,8 @@ class _ContactsScreenState extends State<ContactsScreen> {
                       ),
                       itemCount: users.length,
                       itemBuilder: (context, index) {
-                        final userData =
-                            users[index].data() as Map<String, dynamic>;
-                        final userId = users[index].id;
+                        final userData = users[index];
+                        final userId = userData['id'];
                         final customStatus = userData['status'] ?? 'Available';
                         final isOnline = userData['isOnline'] == true;
                         

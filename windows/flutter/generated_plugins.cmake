@@ -5,12 +5,8 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   audioplayers_windows
-  cloud_firestore
   emoji_picker_flutter
   file_selector_windows
-  firebase_auth
-  firebase_core
-  firebase_storage
   isar_flutter_libs
   passkeys_windows
   record_windows
@@ -18,7 +14,6 @@ list(APPEND FLUTTER_PLUGIN_LIST
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
-  jni
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

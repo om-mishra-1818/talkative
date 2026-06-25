@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'core/storage/local_db.dart';
@@ -10,8 +9,6 @@ import 'features/auth/screens/login_screen.dart';
 import 'features/auth/screens/signup_screen.dart';
 import 'features/chat/providers/chat_provider.dart';
 import 'features/chat/screens/home_screen.dart';
-import 'firebase_options.dart';
-
 import 'core/di/locator.dart';
 import 'core/services/cleanup_service.dart';
 import 'core/network/supabase_realtime_service.dart';
@@ -23,15 +20,6 @@ void main() async {
   // Clean up old audio files
   CleanupService.cleanTemporaryAudioFiles();
 
-  // NOTE: You must run `flutterfire configure` to generate firebase_options.dart
-  // and uncomment the line below. For now we initialize generically (may fail without config).
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-  } catch (e) {
-    debugPrint('Firebase init error: $e. Did you run flutterfire configure?');
-  }
 
   // Initialize Local Isar Database
   await locator<LocalDb>().init();

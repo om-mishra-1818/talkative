@@ -1,48 +1,43 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthProvider with ChangeNotifier {
-  FirebaseAuth? get _auth {
-    try {
-      return FirebaseAuth.instance;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  FirebaseFirestore? get _firestore {
-    try {
-      return FirebaseFirestore.instance;
-    } catch (_) {
-      return null;
-    }
-  }
+  final SupabaseClient _supabase = Supabase.instance.client;
 
   User? _user;
   String? _username;
   bool _isLoading = true;
-
   bool _isSigningUp = false;
 
   bool get isAuthenticated => _user != null && !_isSigningUp;
   String? get username => _username;
-  String? get currentUserId => _user?.uid;
+  String? get currentUserId => _user?.id;
   bool get isLoading => _isLoading;
 
+  StreamSubscription<AuthState>? _authStateSubscription;
+
   AuthProvider() {
-    if (_auth == null) {
-      _isLoading = false;
-      return;
-    }
-    _auth!.authStateChanges().listen((User? user) async {
-      _user = user;
-      if (user != null) {
+    _initAuthListener();
+  }
+
+  void _initAuthListener() {
+    _authStateSubscription = _supabase.auth.onAuthStateChange.listen((data) async {
+      final AuthChangeEvent event = data.event;
+      final Session? session = data.session;
+      
+      _user = session?.user;
+      
+      if (_user != null) {
         try {
-          final doc = await _firestore!.collection('users').doc(user.uid).get();
-          if (doc.exists) {
-            _username = doc.data()?['username'];
+          final response = await _supabase
+              .from('users')
+              .select('username')
+              .eq('id', _user!.id)
+              .maybeSingle();
+              
+          if (response != null) {
+            _username = response['username'];
           }
         } catch (e) {
           debugPrint("Error fetching user data: $e");
@@ -50,32 +45,28 @@ class AuthProvider with ChangeNotifier {
       } else {
         _username = null;
       }
+      
       _isLoading = false;
       notifyListeners();
     });
   }
 
   Future<String?> login(String email, String password) async {
-    if (_auth == null)
-      return "Firebase is not configured! Please run flutterfire configure.";
     try {
-      final userCredential = await _auth!.signInWithEmailAndPassword(
+      final AuthResponse res = await _supabase.auth.signInWithPassword(
         email: email.trim(),
         password: password,
       );
 
       // Update status to online
-      if (userCredential.user != null) {
-        await _firestore!
-            .collection('users')
-            .doc(userCredential.user!.uid)
-            .update({
-              'isOnline': true,
-              'lastSeen': FieldValue.serverTimestamp(),
-            });
+      if (res.user != null) {
+        await _supabase.from('users').update({
+          'isOnline': true,
+          'lastSeen': DateTime.now().toUtc().toIso8601String(),
+        }).eq('id', res.user!.id);
       }
       return null; // Success
-    } on FirebaseAuthException catch (e) {
+    } on AuthException catch (e) {
       debugPrint("Login auth error: ${e.message}");
       return e.message;
     } catch (e) {
@@ -85,51 +76,49 @@ class AuthProvider with ChangeNotifier {
   }
 
   Future<String?> signup(String username, String email, String password) async {
-    if (_auth == null)
-      return "Firebase is not configured! Please run flutterfire configure.";
     try {
       _isSigningUp = true;
       notifyListeners();
 
-      final userCredential = await _auth!.createUserWithEmailAndPassword(
-        email: email.trim(),
-        password: password,
-      );
-
       final trimmedUsername = username.trim();
       
-      // Now that the user is created and authenticated, we can query Firestore
-      final usernameQuery = await _firestore!
-          .collection('users')
-          .where('username', isEqualTo: trimmedUsername)
-          .get();
+      // Check if username exists
+      final usernameQuery = await _supabase
+          .from('users')
+          .select('id')
+          .eq('username', trimmedUsername)
+          .maybeSingle();
           
-      if (usernameQuery.docs.isNotEmpty) {
-        // Username is taken, rollback user creation
-        await userCredential.user?.delete();
+      if (usernameQuery != null) {
         _isSigningUp = false;
         notifyListeners();
         return "Username already exists. Please choose another.";
       }
 
-      if (userCredential.user != null) {
-        await _firestore!.collection('users').doc(userCredential.user!.uid).set({
-          'uid': userCredential.user!.uid,
+      final AuthResponse res = await _supabase.auth.signUp(
+        email: email.trim(),
+        password: password,
+      );
+
+      if (res.user != null) {
+        await _supabase.from('users').insert({
+          'id': res.user!.id,
           'username': trimmedUsername,
           'email': email.trim(),
-          'avatarUrl':
-              'https://ui-avatars.com/api/?name=${Uri.encodeComponent(username)}&background=random',
+          'avatarUrl': 'https://ui-avatars.com/api/?name=${Uri.encodeComponent(username)}&background=random',
           'isOnline': true,
-          'lastSeen': FieldValue.serverTimestamp(),
+          'lastSeen': DateTime.now().toUtc().toIso8601String(),
         });
+        
         _isSigningUp = false;
         notifyListeners();
         return null; // Success
       }
+      
       _isSigningUp = false;
       notifyListeners();
       return "An unknown error occurred.";
-    } on FirebaseAuthException catch (e) {
+    } on AuthException catch (e) {
       _isSigningUp = false;
       notifyListeners();
       debugPrint("Signup auth error: ${e.message}");
@@ -143,37 +132,41 @@ class AuthProvider with ChangeNotifier {
   }
 
   Future<void> logout() async {
-    if (_auth == null) return;
     if (_user != null) {
       try {
-        await _firestore!.collection('users').doc(_user!.uid).update({
+        await _supabase.from('users').update({
           'isOnline': false,
-          'lastSeen': FieldValue.serverTimestamp(),
-        });
+          'lastSeen': DateTime.now().toUtc().toIso8601String(),
+        }).eq('id', _user!.id);
       } catch (e) {
         debugPrint("Error updating offline status: $e");
       }
     }
-    await _auth!.signOut();
+    await _supabase.auth.signOut();
   }
 
   Future<void> updateStatus(String statusStr) async {
-    if (_user == null || _firestore == null) return;
+    if (_user == null) return;
     try {
       final isOnline = statusStr == 'Online' || statusStr == 'Typing' || statusStr == 'Recording Voice' || statusStr == 'On Call';
       final updateData = <String, dynamic>{
         'isOnline': isOnline,
-        'lastSeen': FieldValue.serverTimestamp(),
+        'lastSeen': DateTime.now().toUtc().toIso8601String(),
       };
       
-      // Do not overwrite the user's custom status text when merely going online or offline.
       if (statusStr != 'Online' && statusStr != 'Offline') {
         updateData['status'] = statusStr;
       }
       
-      await _firestore!.collection('users').doc(_user!.uid).update(updateData);
+      await _supabase.from('users').update(updateData).eq('id', _user!.id);
     } catch (e) {
       debugPrint("Error updating status: $e");
     }
+  }
+  
+  @override
+  void dispose() {
+    _authStateSubscription?.cancel();
+    super.dispose();
   }
 }

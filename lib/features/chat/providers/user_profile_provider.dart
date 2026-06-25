@@ -1,8 +1,6 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
@@ -18,25 +16,27 @@ class UserProfileProvider extends ChangeNotifier {
   
   String? localPhotoBase64;
   
-  StreamSubscription? _authSubscription;
-  StreamSubscription? _profileSubscription;
+  StreamSubscription<AuthState>? _authSubscription;
+  RealtimeChannel? _profileSubscription;
+  final SupabaseClient _supabase = Supabase.instance.client;
 
   UserProfileProvider() {
-    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
-      _profileSubscription?.cancel();
+    _authSubscription = _supabase.auth.onAuthStateChange.listen((data) {
+      final Session? session = data.session;
+      _profileSubscription?.unsubscribe();
       _profile = null;
       localPhotoBase64 = null;
       notifyListeners();
       
-      if (user != null) {
-        _initProfileStream(user);
+      if (session?.user != null) {
+        _initProfileStream(session!.user!);
       }
     });
   }
 
   void refresh() {
-    final user = FirebaseAuth.instance.currentUser;
-    _profileSubscription?.cancel();
+    final user = _supabase.auth.currentUser;
+    _profileSubscription?.unsubscribe();
     _profile = null;
     localPhotoBase64 = null;
     notifyListeners();
@@ -45,38 +45,62 @@ class UserProfileProvider extends ChangeNotifier {
     }
   }
 
+  Future<void> _fetchAndSetProfile(User user) async {
+    try {
+      final doc = await _supabase
+          .from('users')
+          .select()
+          .eq('id', user.id)
+          .maybeSingle();
+          
+      if (doc != null) {
+        final prefs = await SharedPreferences.getInstance();
+        localPhotoBase64 = prefs.getString('local_profile_photo_${user.id}');
+        _profile = UserProfileObject.fromJson(doc, doc['id']);
+        notifyListeners();
+      } else {
+        // Create default profile if not exists
+        _profile = UserProfileObject(
+          id: user.id,
+          username: user.userMetadata?['full_name'] ?? 'New User',
+          status: 'Available',
+          avatarUrl: '',
+        );
+        updateProfile(_profile!);
+      }
+    } catch (e) {
+      debugPrint('Error fetching user profile: $e');
+      _profile = UserProfileObject(
+        id: user.id,
+        username: user.email?.split('@').first ?? 'User',
+        status: 'Available',
+        avatarUrl: '',
+      );
+      notifyListeners();
+    }
+  }
+
   void _initProfileStream(User user) {
-      _profileSubscription = FirebaseFirestore.instance
-          .collection('users')
-          .doc(user.uid)
-          .snapshots()
-          .listen((doc) async {
-            if (doc.exists) {
-              final prefs = await SharedPreferences.getInstance();
-              localPhotoBase64 = prefs.getString('local_profile_photo_${user.uid}');
-              _profile = UserProfileObject.fromJson(doc.data()!, doc.id);
-              notifyListeners();
-            } else {
-              // Create default profile if not exists
-              _profile = UserProfileObject(
-                id: user.uid,
-                username: user.displayName ?? 'New User',
-                status: 'Available',
-                avatarUrl: user.photoURL ?? '',
-              );
-              updateProfile(_profile!);
-            }
-          }, onError: (error) {
-            debugPrint('Error listening to user profile: $error');
-            // Set a fallback profile to prevent the UI from loading infinitely
-            _profile = UserProfileObject(
-              id: user.uid,
-              username: user.displayName ?? user.email?.split('@').first ?? 'User',
-              status: 'Available',
-              avatarUrl: user.photoURL ?? '',
-            );
-            notifyListeners();
-          });
+      _fetchAndSetProfile(user);
+      
+      _profileSubscription = _supabase.channel('public:users:id=eq.${user.id}')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'users',
+            filter: PostgresChangeFilter(
+              type: PostgresChangeFilterType.eq,
+              column: 'id',
+              value: user.id,
+            ),
+            callback: (payload) {
+              if (payload.newRecord.isNotEmpty) {
+                _profile = UserProfileObject.fromJson(payload.newRecord, payload.newRecord['id']);
+                notifyListeners();
+              }
+            },
+          )
+          .subscribe();
   }
 
   Future<void> updateProfile(UserProfileObject newProfile) async {
@@ -84,10 +108,9 @@ class UserProfileProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(newProfile.id)
-          .set(newProfile.toJson(), SetOptions(merge: true));
+      await _supabase
+          .from('users')
+          .upsert(newProfile.toJson());
     } catch (e) {
       debugPrint('Error updating profile: $e');
     }
@@ -96,7 +119,7 @@ class UserProfileProvider extends ChangeNotifier {
   Future<void> updatePhoto(File imageFile) async {
     if (_profile == null) return;
 
-    final user = FirebaseAuth.instance.currentUser;
+    final user = _supabase.auth.currentUser;
     if (user == null) return;
 
     _isLoading = true;
@@ -107,26 +130,25 @@ class UserProfileProvider extends ChangeNotifier {
       final bytes = await imageFile.readAsBytes();
       final base64String = base64Encode(bytes);
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('local_profile_photo_${user.uid}', base64String);
+      await prefs.setString('local_profile_photo_${user.id}', base64String);
       localPhotoBase64 = base64String;
       notifyListeners();
 
       try {
-        final ref = FirebaseStorage.instance
-            .ref()
-            .child('profile_photos/${user.uid}.jpg');
-        await ref.putFile(
+        final filePath = '${user.id}/${DateTime.now().millisecondsSinceEpoch}.jpg';
+        await _supabase.storage.from('avatars').upload(
+          filePath,
           imageFile,
-          SettableMetadata(contentType: 'image/jpeg'),
+          fileOptions: const FileOptions(contentType: 'image/jpeg', upsert: true),
         );
-        final downloadUrl = await ref.getDownloadURL();
+        final downloadUrl = _supabase.storage.from('avatars').getPublicUrl(filePath);
 
-        // Writes avatarUrl into the user's Firestore doc; every chat list /
+        // Writes avatarUrl into the user's Supabase doc; every chat list /
         // contacts / chat view that reads avatarUrl picks it up automatically.
         await updateProfile(_profile!.copyWith(avatarUrl: downloadUrl));
       } catch (storageError) {
-        debugPrint('Storage upload failed, falling back to base64 in Firestore: $storageError');
-        // Fallback: save base64 directly to Firestore so other users can see it
+        debugPrint('Storage upload failed, falling back to base64 in Supabase: $storageError');
+        // Fallback: save base64 directly to Supabase so other users can see it
         await updateProfile(_profile!.copyWith(avatarUrl: 'base64:$base64String'));
       }
     } catch (e) {
@@ -137,10 +159,11 @@ class UserProfileProvider extends ChangeNotifier {
       notifyListeners();
     }
   }
+  
   @override
   void dispose() {
     _authSubscription?.cancel();
-    _profileSubscription?.cancel();
+    _profileSubscription?.unsubscribe();
     super.dispose();
   }
 }

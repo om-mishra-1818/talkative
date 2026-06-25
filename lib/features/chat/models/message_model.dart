@@ -1,5 +1,3 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
-
 class MessageModel {
   final String id;
   final String text;
@@ -15,13 +13,14 @@ class MessageModel {
     this.textVolume = 'normal',
   });
 
-  factory MessageModel.fromFirestore(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory MessageModel.fromJson(Map<String, dynamic> data, String docId) {
     return MessageModel(
-      id: doc.id,
+      id: docId,
       text: data['text'] ?? '',
       senderId: data['senderId'] ?? '',
-      timestamp: (data['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      timestamp: data['timestamp'] != null 
+          ? DateTime.parse(data['timestamp']).toLocal() 
+          : DateTime.now(),
       textVolume: data['textVolume'] ?? 'normal',
     );
   }
@@ -30,7 +29,7 @@ class MessageModel {
     return {
       'text': text,
       'senderId': senderId,
-      'timestamp': FieldValue.serverTimestamp(),
+      'timestamp': timestamp.toUtc().toIso8601String(),
       'textVolume': textVolume,
     };
   }

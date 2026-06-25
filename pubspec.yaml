@@ -5,36 +5,32 @@ publish_to: 'none'
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.11.0
+  sdk: ^3.7.0
 
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
-  provider: ^6.1.5+1
-  shared_preferences: ^2.5.5
-  flutter_animate: ^4.5.2
-  intl: ^0.20.2
-  google_fonts: ^8.1.0
-  firebase_core: ^4.11.0
-  firebase_auth: ^6.5.3
-  cloud_firestore: ^6.6.0
-  get_it: ^9.2.1
-  firebase_storage: ^13.4.3
-  image_picker: ^1.2.2
-  cached_network_image: ^3.4.1
+  cupertino_icons: any
+  provider: any
+  shared_preferences: any
+  flutter_animate: any
+  intl: any
+  google_fonts: any
+  get_it: any
+  image_picker: any
+  cached_network_image: any
   supabase_flutter: ^2.15.0
   isar: ^3.1.0+1
   isar_flutter_libs: ^3.1.0+1
-  path_provider: ^2.1.6
-  emoji_picker_flutter: ^4.4.0
-  record: ^6.2.1
-  audioplayers: ^6.7.1
+  path_provider: any
+  emoji_picker_flutter: any
+  record: any
+  audioplayers: any
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^6.0.0
+  flutter_lints: ^5.0.0
   flutter_launcher_icons: ^0.14.2
   build_runner: ^2.4.13
   isar_generator: ^3.1.0+1

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:provider/provider.dart';
 import '../providers/chat_provider.dart';
 import '../models/chat_model.dart';
@@ -11,7 +10,7 @@ class GroupsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser;
+    final user = Supabase.instance.client.auth.currentUser;
     if (user == null) return const Center(child: Text('Not logged in'));
 
     return Column(
@@ -26,16 +25,24 @@ class GroupsScreen extends StatelessWidget {
           centerTitle: true,
         ),
         Expanded(
-          child: StreamBuilder<QuerySnapshot>(
-            stream: FirebaseFirestore.instance
-                .collection('groups')
-                .where('members', arrayContains: user.uid)
-                .snapshots(),
+          child: FutureBuilder<List<Map<String, dynamic>>>(
+            future: Supabase.instance.client
+                .from('groups')
+                .select()
+                .contains('members', [user.id]),
             builder: (context, snapshot) {
               if (snapshot.connectionState == ConnectionState.waiting) {
                 return const Center(child: CircularProgressIndicator());
               }
-              if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+              if (snapshot.hasError) {
+                return Center(
+                  child: Text(
+                    'Error loading groups: ${snapshot.error}',
+                    style: TextStyle(color: Colors.grey.shade500),
+                  ),
+                );
+              }
+              if (!snapshot.hasData || snapshot.data!.isEmpty) {
                 return Center(
                   child: Text(
                     'No groups joined yet.',
@@ -44,12 +51,12 @@ class GroupsScreen extends StatelessWidget {
                 );
               }
 
-              final docs = snapshot.data!.docs;
+              final docs = snapshot.data!;
               return ListView.builder(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 itemCount: docs.length,
                 itemBuilder: (context, index) {
-                  final group = docs[index].data() as Map<String, dynamic>;
+                  final group = docs[index];
                   return ListTile(
                     contentPadding: const EdgeInsets.symmetric(vertical: 8),
                     leading: CustomAvatar(
